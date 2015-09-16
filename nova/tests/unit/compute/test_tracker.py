@@ -246,7 +246,7 @@ _MIGRATION_INSTANCE_FIXTURES = {
         vcpus=_INSTANCE_TYPE_FIXTURES[1]['vcpus'],
         root_gb=_INSTANCE_TYPE_FIXTURES[1]['root_gb'],
         ephemeral_gb=_INSTANCE_TYPE_FIXTURES[1]['ephemeral_gb'],
-        numa_topology=None,
+        numa_topology=_INSTANCE_NUMA_TOPOLOGIES['2mb'],
         instance_type_id=1,
         vm_state=vm_states.ACTIVE,
         power_state=power_state.RUNNING,
@@ -302,6 +302,29 @@ _MIGRATION_INSTANCE_FIXTURES = {
         old_flavor=_INSTANCE_TYPE_OBJ_FIXTURES[1],
         new_flavor=_INSTANCE_TYPE_OBJ_FIXTURES[2],
     ),
+}
+
+_MIGRATION_CONTEXT_FIXTURES = {
+    'f4f0bfea-fe7e-4264-b598-01cb13ef1997': objects.MigrationContext(
+        instance_uuid='f4f0bfea-fe7e-4264-b598-01cb13ef1997',
+        migration_id=3,
+        new_numa_topology=None,
+        old_numa_topology=None),
+    'c17741a5-6f3d-44a8-ade8-773dc8c29124': objects.MigrationContext(
+        instance_uuid='c17741a5-6f3d-44a8-ade8-773dc8c29124',
+        migration_id=3,
+        new_numa_topology=None,
+        old_numa_topology=None),
+    'f15ecfb0-9bf6-42db-9837-706eb2c4bf08': objects.MigrationContext(
+        instance_uuid='f15ecfb0-9bf6-42db-9837-706eb2c4bf08',
+        migration_id=1,
+        new_numa_topology=None,
+        old_numa_topology=_INSTANCE_NUMA_TOPOLOGIES['2mb']),
+    'f6ed631a-8645-4b12-8e1e-2fff55795765': objects.MigrationContext(
+        instance_uuid='f6ed631a-8645-4b12-8e1e-2fff55795765',
+        migration_id=2,
+        new_numa_topology=_INSTANCE_NUMA_TOPOLOGIES['2mb'],
+        old_numa_topology=None),
 }
 
 
@@ -616,7 +639,9 @@ class TestUpdateAvailableResources(BaseTestCase):
         # processing code, and this property calls
         # objects.Instance.get_by_uuid, so we have the migration return
         inst_uuid = migr_obj.instance_uuid
-        get_inst_mock.return_value = _MIGRATION_INSTANCE_FIXTURES[inst_uuid]
+        instance = _MIGRATION_INSTANCE_FIXTURES[inst_uuid].obj_clone()
+        get_inst_mock.return_value = instance
+        instance.migration_context = _MIGRATION_CONTEXT_FIXTURES[inst_uuid]
 
         update_mock = self._update_available_resources()
 
@@ -673,8 +698,10 @@ class TestUpdateAvailableResources(BaseTestCase):
         migr_obj = _MIGRATION_FIXTURES['dest-only']
         migr_mock.return_value = [migr_obj]
         inst_uuid = migr_obj.instance_uuid
-        get_inst_mock.return_value = _MIGRATION_INSTANCE_FIXTURES[inst_uuid]
+        instance = _MIGRATION_INSTANCE_FIXTURES[inst_uuid].obj_clone()
+        get_inst_mock.return_value = instance
         get_cn_mock.return_value = _COMPUTE_NODE_FIXTURES[0]
+        instance.migration_context = _MIGRATION_CONTEXT_FIXTURES[inst_uuid]
 
         update_mock = self._update_available_resources()
 
@@ -708,13 +735,16 @@ class TestUpdateAvailableResources(BaseTestCase):
         self.assertTrue(obj_base.obj_equal_prims(expected_resources,
                                                  self.rt.compute_node))
 
+    @mock.patch('nova.objects.MigrationContext.get_by_instance_uuid',
+                return_value=None)
     @mock.patch('nova.objects.ComputeNode.get_by_host_and_nodename')
     @mock.patch('nova.objects.MigrationList.get_in_progress_by_host_and_node')
     @mock.patch('nova.objects.Instance.get_by_uuid')
     @mock.patch('nova.objects.InstanceList.get_by_host_and_node')
     def test_some_instances_source_and_dest_migration(self, get_mock,
                                                       get_inst_mock, migr_mock,
-                                                      get_cn_mock):
+                                                      get_cn_mock,
+                                                      get_mig_ctxt_mock):
         # We test the behavior of update_available_resource() when
         # there is an active migration that involves this compute node
         # as the destination host AND the source host, and the resource
@@ -731,7 +761,9 @@ class TestUpdateAvailableResources(BaseTestCase):
         inst_uuid = migr_obj.instance_uuid
         # The resizing instance has already had its instance type
         # changed to the *new* instance type (the bigger one, instance type 2)
-        resizing_instance = _MIGRATION_INSTANCE_FIXTURES[inst_uuid]
+        resizing_instance = _MIGRATION_INSTANCE_FIXTURES[inst_uuid].obj_clone()
+        resizing_instance.migration_context = (
+            _MIGRATION_CONTEXT_FIXTURES[resizing_instance.uuid])
         all_instances = _INSTANCE_FIXTURES + [resizing_instance]
         get_mock.return_value = all_instances
         get_inst_mock.return_value = resizing_instance
@@ -1163,6 +1195,7 @@ class TestInstanceClaim(BaseTestCase):
             self.assertEqualNUMAHostTopology(expected_numa, new_numa)
 
 
+@mock.patch('nova.objects.Instance.save')
 @mock.patch('nova.objects.MigrationList.get_in_progress_by_host_and_node')
 @mock.patch('nova.objects.Instance.get_by_uuid')
 @mock.patch('nova.objects.InstanceList.get_by_host_and_node')
@@ -1195,11 +1228,12 @@ class TestMoveClaim(BaseTestCase):
             self.rt.update_available_resource(self.ctx)
 
     def register_mocks(self, pci_mock, inst_list_mock, inst_by_uuid,
-            migr_mock):
+            migr_mock, inst_save_mock):
         pci_mock.return_value = objects.InstancePCIRequests(requests=[])
         self.inst_list_mock = inst_list_mock
         self.inst_by_uuid = inst_by_uuid
         self.migr_mock = migr_mock
+        self.inst_save_mock = inst_save_mock
 
     def audit(self, rt, instances, migrations, migr_inst):
         self.inst_list_mock.return_value = \
@@ -1232,70 +1266,101 @@ class TestMoveClaim(BaseTestCase):
 
     @mock.patch('nova.objects.Flavor.get_by_id')
     def test_claim(self, flavor_mock, pci_mock, inst_list_mock, inst_by_uuid,
-            migr_mock):
+            migr_mock, inst_save_mock):
         """Resize self.instance and check that the expected quantities of each
         resource have been consumed.
         """
 
-        self.register_mocks(pci_mock, inst_list_mock, inst_by_uuid, migr_mock)
+        self.register_mocks(pci_mock, inst_list_mock, inst_by_uuid, migr_mock,
+                            inst_save_mock)
         self.driver_mock.get_host_ip_addr.return_value = "fake-ip"
         flavor_mock.return_value = objects.Flavor(**self.flavor)
+        mig_context_obj = _MIGRATION_CONTEXT_FIXTURES[self.instance.uuid]
+        self.instance.migration_context = mig_context_obj
 
         expected = copy.deepcopy(self.rt.compute_node)
         self.adjust_expected(expected, self.flavor)
 
-        with mock.patch.object(self.rt, '_create_migration') as migr_mock:
+        create_mig_mock = mock.patch.object(self.rt, '_create_migration')
+        mig_ctxt_mock = mock.patch('nova.objects.MigrationContext',
+                                   return_value=mig_context_obj)
+        with create_mig_mock as migr_mock, mig_ctxt_mock as ctxt_mock:
             migr_mock.return_value = _MIGRATION_FIXTURES['source-only']
             claim = self.rt.resize_claim(
                 self.ctx, self.instance, self.flavor, None)
+            self.assertEqual(1, ctxt_mock.call_count)
 
         self.assertIsInstance(claim, claims.MoveClaim)
+        inst_save_mock.assert_called_once_with()
         self.assertTrue(obj_base.obj_equal_prims(expected,
                                                  self.rt.compute_node))
 
     def test_same_host(self, pci_mock, inst_list_mock, inst_by_uuid,
-            migr_mock):
+            migr_mock, inst_save_mock):
         """Resize self.instance to the same host but with a different flavor.
         Then abort the claim. Check that the same amount of resources are
         available afterwards as we started with.
         """
 
-        self.register_mocks(pci_mock, inst_list_mock, inst_by_uuid, migr_mock)
+        self.register_mocks(pci_mock, inst_list_mock, inst_by_uuid, migr_mock,
+                            inst_save_mock)
         migr_obj = _MIGRATION_FIXTURES['source-and-dest']
         self.instance = _MIGRATION_INSTANCE_FIXTURES[migr_obj['instance_uuid']]
+        self.instance._context = self.ctx
+        mig_context_obj = _MIGRATION_CONTEXT_FIXTURES[self.instance.uuid]
+        self.instance.migration_context = mig_context_obj
 
         with mock.patch.object(self.instance, 'save'):
             self.rt.instance_claim(self.ctx, self.instance, None)
         expected = copy.deepcopy(self.rt.compute_node)
 
-        with mock.patch.object(self.rt, '_create_migration') as migr_mock:
+        create_mig_mock = mock.patch.object(self.rt, '_create_migration')
+        mig_ctxt_mock = mock.patch('nova.objects.MigrationContext',
+                                   return_value=mig_context_obj)
+
+        with create_mig_mock as migr_mock, mig_ctxt_mock as ctxt_mock:
             migr_mock.return_value = migr_obj
             claim = self.rt.resize_claim(self.ctx, self.instance,
                     _INSTANCE_TYPE_OBJ_FIXTURES[1], None)
+            self.assertEqual(1, ctxt_mock.call_count)
 
         self.audit(self.rt, [self.instance], [migr_obj], self.instance)
+        inst_save_mock.assert_called_once_with()
         self.assertNotEqual(expected, self.rt.compute_node)
 
-        claim.abort()
-        self.assertTrue(obj_base.obj_equal_prims(expected,
-                                                 self.rt.compute_node))
+        claim.instance.migration_context = mig_context_obj
+        with mock.patch('nova.objects.MigrationContext._destroy') as destroy_m:
+            claim.abort()
+            self.assertTrue(obj_base.obj_equal_prims(expected,
+                                                     self.rt.compute_node))
+            destroy_m.assert_called_once_with(self.ctx, claim.instance.uuid)
 
     def test_revert_reserve_source(
-            self, pci_mock, inst_list_mock, inst_by_uuid, migr_mock):
+            self, pci_mock, inst_list_mock, inst_by_uuid, migr_mock,
+            inst_save_mock):
         """Check that the source node of an instance migration reserves
         resources until the migration has completed, even if the migration is
         reverted.
         """
 
-        self.register_mocks(pci_mock, inst_list_mock, inst_by_uuid, migr_mock)
+        self.register_mocks(pci_mock, inst_list_mock, inst_by_uuid, migr_mock,
+                            inst_save_mock)
 
         # Get our migrations, instances and itypes in a row
         src_migr = _MIGRATION_FIXTURES['source-only']
-        src_instance = _MIGRATION_INSTANCE_FIXTURES[src_migr['instance_uuid']]
+        src_instance = (
+            _MIGRATION_INSTANCE_FIXTURES[src_migr['instance_uuid']].obj_clone()
+        )
+        src_instance.migration_context = (
+            _MIGRATION_CONTEXT_FIXTURES[src_instance.uuid])
         old_itype = _INSTANCE_TYPE_FIXTURES[src_migr['old_instance_type_id']]
         dst_migr = _MIGRATION_FIXTURES['dest-only']
-        dst_instance = _MIGRATION_INSTANCE_FIXTURES[dst_migr['instance_uuid']]
+        dst_instance = (
+            _MIGRATION_INSTANCE_FIXTURES[dst_migr['instance_uuid']].obj_clone()
+        )
         new_itype = _INSTANCE_TYPE_FIXTURES[dst_migr['new_instance_type_id']]
+        dst_instance.migration_context = (
+            _MIGRATION_CONTEXT_FIXTURES[dst_instance.uuid])
 
         # Set up the destination resource tracker
         # update_available_resource to initialise extensible resource trackers
@@ -1341,14 +1406,36 @@ class TestMoveClaim(BaseTestCase):
         self.assertTrue(obj_base.obj_equal_prims(expected,
                                                  src_rt.compute_node))
 
+    def test_update_available_resources_migration_no_context(self, pci_mock,
+            inst_list_mock, inst_by_uuid, migr_mock, inst_save_mock):
+        """When migrating onto older nodes - it is possible for the
+        migration_context record to be missing. Confirm resource audit works
+        regardless.
+        """
+        self.register_mocks(pci_mock, inst_list_mock, inst_by_uuid, migr_mock,
+                            inst_save_mock)
+        migr_obj = _MIGRATION_FIXTURES['source-and-dest']
+        self.instance = _MIGRATION_INSTANCE_FIXTURES[migr_obj['instance_uuid']]
+        self.instance.migration_context = None
+
+        expected = copy.deepcopy(self.rt.compute_node)
+        self.adjust_expected(expected, self.flavor)
+
+        self.audit(self.rt, [], [migr_obj], self.instance)
+        self.assertTrue(obj_base.obj_equal_prims(expected,
+                                                 self.rt.compute_node))
+
     def test_dupe_filter(self, pci_mock, inst_list_mock, inst_by_uuid,
-            migr_mock):
-        self.register_mocks(pci_mock, inst_list_mock, inst_by_uuid, migr_mock)
+            migr_mock, inst_save_mock):
+        self.register_mocks(pci_mock, inst_list_mock, inst_by_uuid, migr_mock,
+                            inst_save_mock)
 
         migr_obj = _MIGRATION_FIXTURES['source-and-dest']
         # This is good enough to prevent a lazy-load; value is unimportant
         migr_obj['updated_at'] = None
         self.instance = _MIGRATION_INSTANCE_FIXTURES[migr_obj['instance_uuid']]
+        self.instance.migration_context = (
+            _MIGRATION_CONTEXT_FIXTURES[self.instance.uuid])
         self.audit(self.rt, [], [migr_obj, migr_obj], self.instance)
         self.assertEqual(1, len(self.rt.tracked_migrations))
 

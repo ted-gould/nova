@@ -238,6 +238,8 @@ class ResourceTracker(object):
                                  image_meta, self, self.compute_node,
                                  overhead=overhead, limits=limits)
         claim.migration = migration
+        instance.migration_context = claim.create_migration_context()
+        instance.save()
 
         # Mark the resources in-use for the resize landing on this
         # compute host:
@@ -324,10 +326,9 @@ class ResourceTracker(object):
             elif not isinstance(image_meta, objects.ImageMeta):
                 image_meta = objects.ImageMeta.from_dict(image_meta)
 
-            if (instance_type is not None and
-                instance_type.id == itype['id']):
-                numa_topology = hardware.numa_get_constraints(
-                    itype, image_meta)
+            if (instance_type is not None and instance_type.id == itype['id']):
+                numa_topology = self._get_migration_context_resource(
+                    'numa_topology', instance)
                 usage = self._get_usage_dict(
                         itype, numa_topology=numa_topology)
                 if self.pci_tracker:
@@ -338,6 +339,8 @@ class ResourceTracker(object):
 
                 ctxt = context.elevated()
                 self._update(ctxt)
+
+            instance.drop_migration_context()
 
     @utils.synchronized(COMPUTE_RESOURCE_SEMAPHORE)
     def update_usage(self, context, instance):
@@ -673,6 +676,14 @@ class ResourceTracker(object):
         # those for now to avoid them being included in below calculations.
         return migration.migration_type in ('resize', 'migration')
 
+    def _get_migration_context_resource(self, resource, instance,
+                                        prefix='new_', itype=None):
+        migration_context = instance.migration_context
+        if migration_context:
+            return getattr(migration_context, prefix + resource)
+        else:
+            return None
+
     def _update_usage_from_migration(self, context, instance, image_meta,
                                      migration):
         """Update usage for a single migration.  The record may
@@ -692,6 +703,7 @@ class ResourceTracker(object):
 
         record = self.tracked_instances.get(uuid, None)
         itype = None
+        numa_topology = None
 
         if same_node:
             # same node resize. record usage for whichever instance type the
@@ -700,21 +712,29 @@ class ResourceTracker(object):
                     migration.old_instance_type_id):
                 itype = self._get_instance_type(context, instance, 'new_',
                         migration.new_instance_type_id)
+                numa_topology = self._get_migration_context_resource(
+                    'numa_topology', instance)
             else:
                 # instance record already has new flavor, hold space for a
                 # possible revert to the old instance type:
                 itype = self._get_instance_type(context, instance, 'old_',
                         migration.old_instance_type_id)
+                numa_topology = self._get_migration_context_resource(
+                    'numa_topology', instance, prefix='old_')
 
         elif incoming and not record:
             # instance has not yet migrated here:
             itype = self._get_instance_type(context, instance, 'new_',
                     migration.new_instance_type_id)
+            numa_topology = self._get_migration_context_resource(
+                'numa_topology', instance)
 
         elif outbound and not record:
             # instance migrated, but record usage for a possible revert:
             itype = self._get_instance_type(context, instance, 'old_',
                     migration.old_instance_type_id)
+            numa_topology = self._get_migration_context_resource(
+                'numa_topology', instance, prefix='old_')
 
         if image_meta is None:
             image_meta = objects.ImageMeta.from_instance(instance)
@@ -724,14 +744,6 @@ class ResourceTracker(object):
             image_meta = objects.ImageMeta.from_dict(image_meta)
 
         if itype:
-            host_topology = self.compute_node.get('numa_topology')
-            if host_topology:
-                host_topology = objects.NUMATopology.obj_from_db_obj(
-                        host_topology)
-            numa_topology = hardware.numa_get_constraints(itype, image_meta)
-            numa_topology = (
-                    hardware.numa_fit_instance_to_host(
-                        host_topology, numa_topology))
             usage = self._get_usage_dict(
                         itype, numa_topology=numa_topology)
             if self.pci_tracker:
@@ -746,36 +758,37 @@ class ResourceTracker(object):
             self.tracked_migrations[uuid] = (migration, itype)
 
     def _update_usage_from_migrations(self, context, migrations):
-
-        self.tracked_migrations.clear()
-
         filtered = {}
+        instances = {}
+        self.tracked_migrations.clear()
 
         # do some defensive filtering against bad migrations records in the
         # database:
         for migration in migrations:
+            uuid = migration.instance_uuid
+
             try:
-                instance = migration.instance
+                if uuid not in instances:
+                    instances[uuid] = migration.instance
             except exception.InstanceNotFound as e:
                 # migration referencing deleted instance
                 LOG.debug('Migration instance not found: %s', e)
                 continue
 
-            uuid = instance.uuid
-
             # skip migration if instance isn't in a resize state:
-            if not _instance_in_resize_state(instance):
+            if not _instance_in_resize_state(instances[uuid]):
                 LOG.warning(_LW("Instance not resizing, skipping migration."),
                             instance_uuid=uuid)
                 continue
 
             # filter to most recently updated migration for each instance:
-            m = filtered.get(uuid, None)
-            if not m or migration.updated_at >= m.updated_at:
+            other_migration = filtered.get(uuid, None)
+            if (not other_migration or
+                    migration.updated_at >= other_migration.updated_at):
                 filtered[uuid] = migration
 
         for migration in filtered.values():
-            instance = migration.instance
+            instance = instances[migration.instance_uuid]
             try:
                 self._update_usage_from_migration(context, instance, None,
                                                   migration)
