@@ -1,0 +1,64 @@
+name: nova
+summary: Cloud computing fabric controller
+description: OpenStack's Compute module
+vendor: OpenStack <openstack-dev@lists.openstack.org>
+version: 12.0.0
+icon: icon.svg
+
+parts:
+  python3:
+    requirements: requirements.txt 
+    stage-packages: [libxml2-dev, libxslt1-dev]
+  nova:
+    type: python3-project
+    after: [python3]
+    source: .
+
+binaries:
+  - name: nova-idmapshift
+    exec: python3 usr/bin/nova-idmapshift
+  - name: nova-api
+    exec: python3 usr/bin/nova-api
+  - name: nova-xvpvncproxy
+    exec: python3 usr/bin/nova-xvpvncproxy
+  - name: nova-api-metadata
+    exec: python3 usr/bin/nova-api-metadata
+  - name: nova-all
+    exec: python3 usr/bin/nova-all
+  - name: nova-compute
+    exec: python3 usr/bin/nova-compute
+  - name: nova-console
+    exec: python3 usr/bin/nova-console
+  - name: nova-network
+    exec: python3 usr/bin/nova-network
+  - name: nova-api-ec2
+    exec: python3 usr/bin/nova-api-ec2
+  - name: nova-rootwrap-daemon
+    exec: python3 usr/bin/nova-rootwrap-daemon
+  - name: nova-serialproxy
+    exec: python3 usr/bin/nova-serialproxy
+  - name: nova-api-os-compute
+    exec: python3 usr/bin/nova-api-os-compute
+  - name: nova-spicehtml5proxy
+    exec: python3 usr/bin/nova-spicehtml5proxy
+  - name: nova-consoleauth
+    exec: python3 usr/bin/nova-consoleauth
+  - name: nova-dhcpbridge
+    exec: python3 usr/bin/nova-dhcpbridge
+  - name: nova-cells
+    exec: python3 usr/bin/nova-cells
+  - name: nova-conductor
+    exec: python3 usr/bin/nova-conductor
+  - name: nova-scheduler
+    exec: python3 usr/bin/nova-scheduler
+  - name: nova-novncproxy
+    exec: python3 usr/bin/nova-novncproxy
+  - name: nova-objectstore
+    exec: python3 usr/bin/nova-objectstore
+  - name: nova-cert
+    exec: python3 usr/bin/nova-cert
+  - name: nova-manage
+    exec: python3 usr/bin/nova-manage
+  - name: nova-rootwrap
+    exec: python3 usr/bin/nova-rootwrap
+
